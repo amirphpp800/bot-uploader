@@ -123,12 +123,11 @@ async function ensureBotUsername(env) {
 }
 
 function getForceJoinChannel(env) {
-  // For panel display
-  const r = getForceJoinRule(env);
-  if (!r || r.type === 'none') return '';
-  if (r.type === 'username') return `@${r.username}`;
-  if (r.type === 'private') return r.invite || 'خصوصی';
-  return '';
+  // For panel display (summary)
+  const rules = getForceJoinRules(env);
+  if (!rules.length) return '';
+  const labels = rules.slice(0, 3).map((r) => r.type === 'username' ? `@${r.username}` : 'خصوصی');
+  return rules.length > 3 ? `${labels.join('، ')} و ${rules.length - 3} مورد دیگر` : labels.join('، ');
 }
 
 async function loadConfig(env) {
@@ -138,13 +137,20 @@ async function loadConfig(env) {
       const fj = await env.DATA.get('config:force_join_channel');
       if (fj) {
         try {
-          const obj = JSON.parse(fj);
-          env.__forceJoinRule = obj;
+          const parsed = JSON.parse(fj);
+          if (Array.isArray(parsed)) {
+            env.__forceJoinRules = parsed;
+          } else if (parsed && typeof parsed === 'object') {
+            env.__forceJoinRules = [parsed];
+          } else {
+            env.__forceJoinRules = [];
+          }
         } catch {
-          env.__forceJoinRule = { type: 'username', username: fj.replace(/^@/, '') };
+          // Backward compat: plain username string
+          env.__forceJoinRules = [{ type: 'username', username: fj.replace(/^@/, '') }];
         }
       } else {
-        env.__forceJoinRule = env.__forceJoinRule || { type: 'none' };
+        env.__forceJoinRules = env.__forceJoinRules || [];
       }
       const admins = await env.DATA.get('config:admins');
       if (admins) {
@@ -159,14 +165,31 @@ async function loadConfig(env) {
   }
 }
 
-function getForceJoinRule(env) {
-  return env.__forceJoinRule || { type: 'none' };
+function getForceJoinRules(env) {
+  return Array.isArray(env.__forceJoinRules) ? env.__forceJoinRules : [];
 }
 
-async function setForceJoinRule(env, rule) {
-  env.__forceJoinRule = rule;
+async function setForceJoinRules(env, rules) {
+  env.__forceJoinRules = rules;
   if (!env.DATA) return;
-  try { await env.DATA.put('config:force_join_channel', JSON.stringify(rule)); } catch (e) { console.warn('setForceJoinRule failed', e); }
+  try { await env.DATA.put('config:force_join_channel', JSON.stringify(rules)); } catch (e) { console.warn('setForceJoinRules failed', e); }
+}
+
+function ruleKey(r) {
+  if (!r || r.type === 'none') return 'none';
+  if (r.type === 'username') return `u:${r.username}`;
+  if (r.type === 'private') return `p:${r.chat_id||''}:${r.invite||''}`;
+  return JSON.stringify(r);
+}
+
+async function appendForceJoinRule(env, rule) {
+  const existing = getForceJoinRules(env);
+  const keys = new Set(existing.map(ruleKey));
+  if (!keys.has(ruleKey(rule))) {
+    existing.push(rule);
+    await setForceJoinRules(env, existing);
+  }
+  return existing;
 }
 
 async function listAdmins(env) {
@@ -413,26 +436,27 @@ async function handleBroadcast(env, text, ctx, chatId) {
 }
 
 async function enforceJoin(env, userId) {
-  const rule = getForceJoinRule(env);
-  if (!rule || rule.type === 'none') return { required: false, ok: true, channel: '' };
-  if (rule.type === 'username') {
-    const channel = rule.username.replace(/^@/, '');
-    const r = await tgGet(env, 'getChatMember', { chat_id: `@${channel}`, user_id: userId });
-    if (!r.ok) return { required: true, ok: false, channel };
-    const status = r.result?.status;
-    const ok = status && status !== 'left' && status !== 'kicked';
-    return { required: true, ok, channel };
+  const rules = getForceJoinRules(env);
+  if (!rules.length) return { required: false, ok: true };
+  for (const rule of rules) {
+    if (rule.type === 'username') {
+      const channel = rule.username.replace(/^@/, '');
+      const r = await tgGet(env, 'getChatMember', { chat_id: `@${channel}`, user_id: userId });
+      if (!r.ok) return { required: true, ok: false };
+      const status = r.result?.status;
+      const ok = status && status !== 'left' && status !== 'kicked';
+      if (!ok) return { required: true, ok: false };
+    } else if (rule.type === 'private') {
+      const chat_id = rule.chat_id;
+      if (!chat_id) return { required: true, ok: false };
+      const r = await tgGet(env, 'getChatMember', { chat_id, user_id: userId });
+      if (!r.ok) return { required: true, ok: false };
+      const status = r.result?.status;
+      const ok = status && status !== 'left' && status !== 'kicked';
+      if (!ok) return { required: true, ok: false };
+    }
   }
-  if (rule.type === 'private') {
-    const chat_id = rule.chat_id;
-    if (!chat_id) return { required: true, ok: false, channel: '' };
-    const r = await tgGet(env, 'getChatMember', { chat_id, user_id: userId });
-    if (!r.ok) return { required: true, ok: false, channel: '' };
-    const status = r.result?.status;
-    const ok = status && status !== 'left' && status !== 'kicked';
-    return { required: true, ok, channel: '' };
-  }
-  return { required: false, ok: true, channel: '' };
+  return { required: true, ok: true };
 }
 
 async function sendMediaByType(env, chatId, media, extra = {}) {
@@ -480,16 +504,13 @@ async function handleStart(env, request, update) {
 
   const rule = await enforceJoin(env, userId);
   if (rule.required && !rule.ok) {
-    const fr = getForceJoinRule(env);
-    let joinUrl = 'https://t.me';
-    if (fr && fr.type === 'username') joinUrl = `https://t.me/${fr.username}`;
-    if (fr && fr.type === 'private' && fr.invite) joinUrl = fr.invite;
-    const keyboard = {
-      inline_keyboard: [
-        [{ text: 'عضویت در کانال', url: joinUrl }],
-        [{ text: 'بررسی عضویت ✅', callback_data: `check:${code}` }],
-      ],
-    };
+    const rules = getForceJoinRules(env);
+    const rows = [];
+    for (const r of rules) {
+      const url = r.type === 'username' ? `https://t.me/${r.username}` : (r.invite || 'https://t.me');
+      rows.push([{ text: 'عضویت در کانال', url }]);
+    }
+    const keyboard = { inline_keyboard: [...rows, [{ text: 'بررسی عضویت ✅', callback_data: `check:${code}` }]] };
     await tgCall(env, 'sendMessage', {
       chat_id: chatId,
       text: 'لطفاً ابتدا در کانال عضو شوید و سپس روی دکمه «بررسی عضویت» بزنید.',
@@ -534,16 +555,13 @@ async function handleCallback(env, update) {
     const rule = await enforceJoin(env, userId);
     if (!rule.ok) {
       await answer('هنوز عضو کانال نشده‌اید.');
-      const fr = getForceJoinRule(env);
-      let joinUrl = 'https://t.me';
-      if (fr && fr.type === 'username') joinUrl = `https://t.me/${fr.username}`;
-      if (fr && fr.type === 'private' && fr.invite) joinUrl = fr.invite;
-      const keyboard = {
-        inline_keyboard: [
-          [{ text: 'عضویت در کانال', url: joinUrl }],
-          [{ text: 'بررسی عضویت ✅', callback_data: `check:${code}` }],
-        ],
-      };
+      const rules = getForceJoinRules(env);
+      const rows = [];
+      for (const r of rules) {
+        const url = r.type === 'username' ? `https://t.me/${r.username}` : (r.invite || 'https://t.me');
+        rows.push([{ text: 'عضویت در کانال', url }]);
+      }
+      const keyboard = { inline_keyboard: [...rows, [{ text: 'بررسی عضویت ✅', callback_data: `check:${code}` }]] };
       await tgCall(env, 'sendMessage', {
         chat_id: chatId,
         text: 'لطفاً ابتدا در کانال عضو شوید و سپس روی دکمه «بررسی عضویت» بزنید.',
@@ -729,8 +747,8 @@ async function handleCallback(env, update) {
         return;
       }
       await answer('حذف شد');
-      await setForceJoinRule(env, { type: 'none' });
-      await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'کانال جویـن حذف شد.' });
+      await setForceJoinRules(env, []);
+      await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'تمام کانال‌های جویـن حذف شدند.' });
       return;
     }
     if (data === 'admin:cancel') {
@@ -923,8 +941,8 @@ async function handleWebhook(request, env, ctx) {
           const raw = msg.text.trim();
           if (raw.toLowerCase() === 'off') {
             await clearState(env, userId);
-            await setForceJoinRule(env, { type: 'none' });
-            await tgCall(env, 'sendMessage', { chat_id: msg.chat.id, text: 'جویـن اجباری غیرفعال شد.' });
+            await setForceJoinRules(env, []);
+            await tgCall(env, 'sendMessage', { chat_id: msg.chat.id, text: 'تمام کانال‌های جویـن حذف شدند.' });
             await sendAdminMenu(env, msg.chat.id, userId);
             return jsonResponse({ ok: true });
           }
@@ -938,8 +956,8 @@ async function handleWebhook(request, env, ctx) {
           // Username
           const username = raw.replace(/^@/, '');
           await clearState(env, userId);
-          await setForceJoinRule(env, { type: 'username', username });
-          await tgCall(env, 'sendMessage', { chat_id: msg.chat.id, text: `کانال اجباری تنظیم شد: @${username}` });
+          await appendForceJoinRule(env, { type: 'username', username });
+          await tgCall(env, 'sendMessage', { chat_id: msg.chat.id, text: `کانال اجباری اضافه شد: @${username}` });
           await sendAdminMenu(env, msg.chat.id, userId);
           return jsonResponse({ ok: true });
         }
@@ -949,8 +967,8 @@ async function handleWebhook(request, env, ctx) {
         const invite = st.split(':').slice(1).join(':');
         const chId = msg.forward_from_chat.id;
         await clearState(env, userId);
-        await setForceJoinRule(env, { type: 'private', chat_id: chId, invite });
-        await tgCall(env, 'sendMessage', { chat_id: msg.chat.id, text: 'کانال خصوصی برای جویـن اجباری تنظیم شد.' });
+        await appendForceJoinRule(env, { type: 'private', chat_id: chId, invite });
+        await tgCall(env, 'sendMessage', { chat_id: msg.chat.id, text: 'کانال خصوصی به جویـن اجباری اضافه شد.' });
         await sendAdminMenu(env, msg.chat.id, userId);
         return jsonResponse({ ok: true });
       }
@@ -963,8 +981,8 @@ async function handleWebhook(request, env, ctx) {
           return jsonResponse({ ok: true });
         }
         await clearState(env, userId);
-        await setForceJoinRule(env, { type: 'private', chat_id: chId, invite: raw });
-        await tgCall(env, 'sendMessage', { chat_id: msg.chat.id, text: 'کانال خصوصی برای جویـن اجباری تنظیم شد.' });
+        await appendForceJoinRule(env, { type: 'private', chat_id: chId, invite: raw });
+        await tgCall(env, 'sendMessage', { chat_id: msg.chat.id, text: 'کانال خصوصی به جویـن اجباری اضافه شد.' });
         await sendAdminMenu(env, msg.chat.id, userId);
         return jsonResponse({ ok: true });
       }
