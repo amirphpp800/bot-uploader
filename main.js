@@ -34,14 +34,29 @@ function htmlResponse(html, init = {}) {
 }
 
 function parseAdmins(env) {
-  const raw = (env.ADMIN || '').trim();
-  if (!raw) return new Set();
+  // Union of owners (ENV) and extra admins from KV (loaded into env.__extraAdmins by loadConfig)
+  const ownersRaw = (env.ADMIN || '').trim();
+  const owners = ownersRaw
+    ? ownersRaw.split(',').map((s) => s.trim()).filter(Boolean)
+    : [];
+  const extras = Array.from(env.__extraAdmins || new Set());
+  return new Set([...owners, ...extras]);
+}
+
+function ownersSet(env) {
+  const ownersRaw = (env.ADMIN || '').trim();
+  if (!ownersRaw) return new Set();
   return new Set(
-    raw
+    ownersRaw
       .split(',')
       .map((s) => s.trim())
       .filter(Boolean)
   );
+}
+
+function isOwner(userId, env) {
+  const owners = ownersSet(env);
+  return owners.has(String(userId));
 }
 
 function isAdmin(userId, env) {
@@ -118,10 +133,39 @@ async function loadConfig(env) {
     if (env.DATA) {
       const fj = await env.DATA.get('config:force_join_channel');
       if (fj) env.__forceJoinChannel = fj;
+      const admins = await env.DATA.get('config:admins');
+      if (admins) {
+        const arr = admins.split(',').map((s) => s.trim()).filter(Boolean);
+        env.__extraAdmins = new Set(arr);
+      } else {
+        env.__extraAdmins = env.__extraAdmins || new Set();
+      }
     }
   } catch (e) {
     console.warn('Config load failed', e);
   }
+}
+
+async function listAdmins(env) {
+  const all = Array.from(parseAdmins(env));
+  return all;
+}
+
+async function addAdmin(env, targetId) {
+  if (!env.DATA) throw new Error('KV not bound');
+  const id = String(targetId || '').trim();
+  if (!id || !/^\d+$/.test(id)) throw new Error('invalid id');
+  const current = (await env.DATA.get('config:admins')) || '';
+  const set = new Set(
+    current
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+  );
+  set.add(id);
+  const out = Array.from(set).join(',');
+  await env.DATA.put('config:admins', out);
+  env.__extraAdmins = new Set(Array.from(set));
 }
 
 async function ensureUser(env, userId) {
@@ -230,6 +274,9 @@ async function sendAdminMenu(env, chatId) {
       [
         { text: 'تنظیم جویـن', callback_data: 'admin:setjoin' },
         { text: 'خاموش کردن جویـن', callback_data: 'admin:disablejoin' },
+      ],
+      [
+        { text: 'مدیریت ادمین‌ها', callback_data: 'admin:admins' },
       ],
       [
         { text: 'بروزرسانی منو 🔄', callback_data: 'admin:menu' },
@@ -405,6 +452,34 @@ async function handleCallback(env, update) {
     if (data === 'admin:menu') {
       await answer('منو');
       await sendAdminMenu(env, chatId, true);
+      return;
+    }
+    if (data === 'admin:admins') {
+      await answer('ادمین‌ها');
+      const kb = { inline_keyboard: [
+        [{ text: 'افزودن ادمین ➕', callback_data: 'admin:addadmin' }],
+        [{ text: 'لیست ادمین‌ها 📋', callback_data: 'admin:listadmins' }],
+        [{ text: 'بازگشت', callback_data: 'admin:menu' }],
+      ] };
+      await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'مدیریت ادمین‌ها', reply_markup: kb });
+      return;
+    }
+    if (data === 'admin:addadmin') {
+      if (!isOwner(userId, env)) {
+        await answer('اجازه ندارید.');
+        await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'فقط صاحبان (ADMIN در ENV) می‌توانند ادمین جدید اضافه کنند.' });
+        return;
+      }
+      await setState(env, userId, 'await_add_admin');
+      const kb = { inline_keyboard: [[{ text: 'انصراف', callback_data: 'admin:cancel' }]] };
+      await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'آی‌دی عددی کاربر را ارسال کنید.', reply_markup: kb });
+      await answer('بفرستید');
+      return;
+    }
+    if (data === 'admin:listadmins') {
+      const arr = await listAdmins(env);
+      await tgCall(env, 'sendMessage', { chat_id: chatId, text: arr.length ? `ادمین‌ها:\n${arr.join('\n')}` : 'ادمینی ثبت نشده.' });
+      await answer('نمایش لیست');
       return;
     }
     if (data === 'admin:upload') {
@@ -672,9 +747,7 @@ function panelHtml({ kvConnected, users, media, forceJoin, base }) {
   .tile{display:flex;flex-direction:column;gap:8px;padding:16px}
   .tile h3{margin:0 0 4px 0;font-size:14px;font-weight:600;color:var(--muted)}
   .tile p{margin:0;font-size:22px;font-weight:700}
-  .row{display:flex;gap:12px;flex-wrap:wrap}
-  .btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:12px 14px;border-radius:12px;text-decoration:none;color:var(--text);border:1px solid var(--stroke);background:var(--glass)}
-  .btn:hover{border-color:#4b5bd6;background:rgba(255,255,255,.09)}
+  .muted{opacity:.85}
   .ok{color:var(--ok)}
   .bad{color:var(--bad)}
   code{background:rgba(255,255,255,.08);padding:2px 6px;border-radius:8px;border:1px solid var(--stroke)}
@@ -690,39 +763,23 @@ function panelHtml({ kvConnected, users, media, forceJoin, base }) {
       <div class="tile glass">
         <h3>اتصال KV</h3>
         <p class="${kvConnected ? 'ok' : 'bad'}">${kvConnected ? 'متصل' : 'نامتصل'}</p>
-        <div class="row">
-          <a class="btn" href="#">وضعیت</a>
-          <a class="btn" href="#" onclick="location.reload();return false;">بازخوانی</a>
-        </div>
       </div>
       <div class="tile glass">
         <h3>کاربران</h3>
         <p>${users}</p>
-        <div class="row">
-          <a class="btn" href="#">لیست (KV)</a>
-        </div>
       </div>
       <div class="tile glass">
         <h3>رسانه‌ها</h3>
         <p>${media}</p>
-        <div class="row">
-          <a class="btn" href="#">بسته‌ها/تکی</a>
-        </div>
       </div>
       <div class="tile glass">
         <h3>جویـن اجباری</h3>
         <p>${forceJoin || 'غیرفعال'}</p>
-        <div class="row">
-          <a class="btn" href="${base}/" title="فقط نمایشی">مدیریت</a>
-        </div>
       </div>
     </div>
     <div class="tile glass">
       <h3>وبهوک</h3>
-      <p>آدرس وبهوک: <code>${base}/webhook</code></p>
-      <div class="row">
-        <a class="btn" href="https://api.telegram.org/bot<BOT_TOKEN>/getWebhookInfo" target="_blank" rel="noreferrer">مشاهده در تلگرام</a>
-      </div>
+      <p class="muted">آدرس وبهوک: <code>${base}/webhook</code></p>
     </div>
   </main>
   <footer class="glass">
