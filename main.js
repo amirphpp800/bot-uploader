@@ -182,6 +182,59 @@ function ruleKey(r) {
   return JSON.stringify(r);
 }
 
+// Human-friendly label for a force-join rule
+function ruleLabel(r) {
+  if (!r) return 'نامعتبر';
+  if (r.type === 'username') return `@${(r.username || '').replace(/^@/, '')}`;
+  if (r.type === 'private') return `خصوصی ${r.chat_id || ''}`;
+  return 'نامعتبر';
+}
+
+// Temporary selection storage for remove-join flow
+async function getRemoveSelection(env, userId) {
+  if (!env.DATA) return new Set();
+  try {
+    const raw = await env.DATA.get(`tmp:rmjoin:${userId}`);
+    if (!raw) return new Set();
+    const arr = JSON.parse(raw);
+    return new Set(Array.isArray(arr) ? arr : []);
+  } catch {
+    return new Set();
+  }
+}
+
+async function setRemoveSelection(env, userId, set) {
+  if (!env.DATA) return;
+  try {
+    await env.DATA.put(`tmp:rmjoin:${userId}`, JSON.stringify(Array.from(set || [])));
+  } catch (e) { console.warn('setRemoveSelection failed', e); }
+}
+
+async function clearRemoveSelection(env, userId) {
+  if (!env.DATA) return;
+  try { await env.DATA.delete(`tmp:rmjoin:${userId}`); } catch (e) { console.warn('clearRemoveSelection failed', e); }
+}
+
+function buildRemoveJoinKeyboard(rules, selectedKeys) {
+  const rows = [];
+  for (const r of rules) {
+    const key = ruleKey(r);
+    const sel = selectedKeys.has(key);
+    const text = `${sel ? '✅ ' : ''}${ruleLabel(r)}`;
+    rows.push([{ text, callback_data: `rmjoin:toggle:${key}` }]);
+  }
+  // Controls row
+  rows.push([
+    { text: 'انتخاب همه', callback_data: 'rmjoin:all' },
+    { text: 'هیچکدام', callback_data: 'rmjoin:none' },
+  ]);
+  rows.push([
+    { text: 'حذف موارد انتخاب‌شده 🗑️', callback_data: 'rmjoin:confirm' },
+  ]);
+  rows.push([{ text: 'بازگشت', callback_data: 'admin:menu' }]);
+  return { inline_keyboard: rows };
+}
+
 async function appendForceJoinRule(env, rule) {
   const existing = getForceJoinRules(env);
   const keys = new Set(existing.map(ruleKey));
@@ -746,13 +799,62 @@ async function handleCallback(env, update) {
         await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'این بخش فقط برای صاحب ربات است.' });
         return;
       }
-      await answer('حذف شد');
-      await setForceJoinRules(env, []);
-      await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'تمام کانال‌های جویـن حذف شدند.' });
+      const rules = getForceJoinRules(env);
+      if (!rules.length) {
+        await answer('لیست خالی است');
+        await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'هیچ کانالی برای حذف وجود ندارد.' });
+        return;
+      }
+      const selected = await getRemoveSelection(env, userId);
+      const kb = buildRemoveJoinKeyboard(rules, selected);
+      await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'کانال‌های جویـن اجباری را برای حذف انتخاب کنید:', reply_markup: kb });
+      await answer('لیست کانال‌ها');
+      return;
+    }
+    if (data.startsWith('rmjoin:')) {
+      if (!isOwner(userId, env)) {
+        await answer('اجازه ندارید');
+        return;
+      }
+      const rules = getForceJoinRules(env);
+      const selected = await getRemoveSelection(env, userId);
+      const msgId = q.message?.message_id;
+      const sub = data.split(':')[1];
+      if (sub === 'toggle') {
+        const key = data.split(':').slice(2).join(':');
+        const exists = rules.some((r) => ruleKey(r) === key);
+        if (exists) {
+          if (selected.has(key)) selected.delete(key); else selected.add(key);
+          await setRemoveSelection(env, userId, selected);
+        }
+      } else if (sub === 'all') {
+        for (const r of rules) selected.add(ruleKey(r));
+        await setRemoveSelection(env, userId, selected);
+      } else if (sub === 'none') {
+        selected.clear();
+        await setRemoveSelection(env, userId, selected);
+      } else if (sub === 'confirm') {
+        // Delete selected
+        const before = rules.length;
+        const remaining = rules.filter((r) => !selected.has(ruleKey(r)));
+        const removed = before - remaining.length;
+        await setForceJoinRules(env, remaining);
+        await clearRemoveSelection(env, userId);
+        await tgCall(env, 'sendMessage', { chat_id: chatId, text: removed ? `${removed} مورد حذف شد.` : 'هیچ موردی انتخاب نشده بود.' });
+        await answer('انجام شد');
+        return;
+      }
+      // Update the inline keyboard to reflect selection state
+      const kb = buildRemoveJoinKeyboard(getForceJoinRules(env), await getRemoveSelection(env, userId));
+      if (msgId) {
+        await tgCall(env, 'editMessageReplyMarkup', { chat_id: chatId, message_id: msgId, reply_markup: kb });
+      }
+      await answer('به‌روز شد');
       return;
     }
     if (data === 'admin:cancel') {
       await answer('انصراف');
+      await clearRemoveSelection(env, userId);
       await clearState(env, userId);
       await sendAdminMenu(env, chatId, userId);
       return;
@@ -1058,7 +1160,7 @@ async function handleWebhook(request, env, ctx) {
   return jsonResponse({ ok: true });
 }
 
-function panelHtml({ kvConnected, users, media, forceJoin, base }) {
+function panelHtml({ kvConnected, users, media, forceJoin, base, rules = [], flash = '', key = '', authRequired = false }) {
   return `<!doctype html>
 <html lang="fa" dir="rtl">
 <head>
@@ -1128,6 +1230,15 @@ function panelHtml({ kvConnected, users, media, forceJoin, base }) {
 </html>`;
 }
 
+function panelAuthorized(request, env, formKey) {
+  const need = (env.PANEL_KEY || '').trim();
+  if (!need) return true; // no key required
+  const url = new URL(request.url);
+  const qKey = url.searchParams.get('key') || '';
+  const k = (formKey || qKey || '').trim();
+  return k && k === need;
+}
+
 async function handlePanel(request, env) {
   await loadConfig(env);
   const kvConnected = !!env.DATA;
@@ -1140,12 +1251,53 @@ async function handlePanel(request, env) {
       console.warn('stats error', e);
     }
   }
+
+  let flash = '';
+  const url = new URL(request.url);
+  const queryKey = url.searchParams.get('key') || '';
+
+  if (request.method === 'POST') {
+    const fd = await request.formData();
+    const formKey = fd.get('key') || '';
+    const action = (fd.get('action') || '').toString();
+    if (!panelAuthorized(request, env, formKey)) {
+      return htmlResponse('<h3 style="font-family:system-ui">403 - دسترسی غیرمجاز</h3>', { status: 403 });
+    }
+    if (action === 'add_username') {
+      const raw = (fd.get('username') || '').toString().trim();
+      if (raw) {
+        const username = raw.replace(/^@/, '');
+        await appendForceJoinRule(env, { type: 'username', username });
+        flash = `کانال @${username} افزوده شد.`;
+      }
+    } else if (action === 'add_private') {
+      const invite = (fd.get('invite') || '').toString().trim();
+      const chat_id = (fd.get('chat_id') || '').toString().trim();
+      if (invite && chat_id) {
+        await appendForceJoinRule(env, { type: 'private', chat_id, invite });
+        flash = 'کانال خصوصی افزوده شد.';
+      }
+    } else if (action === 'delete_selected') {
+      const keys = fd.getAll('keys');
+      const rules = getForceJoinRules(env);
+      const keySet = new Set(keys.map(String));
+      const remaining = rules.filter((r) => !keySet.has(ruleKey(r)));
+      const removed = rules.length - remaining.length;
+      await setForceJoinRules(env, remaining);
+      flash = removed ? `${removed} مورد حذف شد.` : 'موردی انتخاب نشده بود.';
+    }
+  }
+
   const html = panelHtml({
     kvConnected,
     users,
     media,
     forceJoin: getForceJoinChannel(env),
     base: siteBase(request),
+    rules: getForceJoinRules(env),
+    flash,
+    key: queryKey,
+    authRequired: !!(env.PANEL_KEY || '').trim(),
   });
   return htmlResponse(html);
 }
@@ -1192,7 +1344,7 @@ const APP = {
       return handleWebhook(request, env, ctx);
     }
 
-    if ((url.pathname === '/' || url.pathname === '/panel') && request.method === 'GET') {
+    if (url.pathname === '/' || url.pathname === '/panel') {
       return handlePanel(request, env);
     }
 
