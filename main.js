@@ -218,6 +218,62 @@ async function addBundleItem(env, code, item) {
   }
 }
 
+async function getCodeType(env, code) {
+  if (!env.DATA) return null;
+  try {
+    const m = await env.DATA.get(`media:${code}`);
+    if (m) return 'media';
+    const b = await env.DATA.get(`bundle:${code}`);
+    if (b) return 'bundle';
+  } catch (e) {
+    console.warn('getCodeType failed', e);
+  }
+  return null;
+}
+
+async function setDisabled(env, code, disabled) {
+  const t = await getCodeType(env, code);
+  if (!t) return false;
+  if (t === 'media') {
+    const obj = await getMedia(env, code);
+    if (!obj) return false;
+    obj.disabled = !!disabled;
+    await saveMedia(env, obj);
+    return true;
+  }
+  if (t === 'bundle') {
+    const obj = await getBundle(env, code);
+    if (!obj) return false;
+    obj.disabled = !!disabled;
+    try { await env.DATA.put(`bundle:${code}`, JSON.stringify(obj)); } catch (e) { console.warn('save bundle failed', e); return false; }
+    return true;
+  }
+  return false;
+}
+
+async function deleteCode(env, code) {
+  if (!env.DATA) return false;
+  try {
+    await env.DATA.delete(`media:${code}`);
+    await env.DATA.delete(`bundle:${code}`);
+    return true;
+  } catch (e) {
+    console.warn('deleteCode failed', e);
+    return false;
+  }
+}
+
+async function getLinkInfo(env, code) {
+  const t = await getCodeType(env, code);
+  if (!t) return null;
+  if (t === 'media') {
+    const m = await getMedia(env, code);
+    return { type: 'media', disabled: !!m?.disabled, created_at: m?.created_at || 0, caption: m?.caption || '', media_type: m?.type || '' };
+  }
+  const b = await getBundle(env, code);
+  return { type: 'bundle', disabled: !!b?.disabled, created_at: b?.created_at || 0, count: Array.isArray(b?.items) ? b.items.length : 0 };
+}
+
 async function countByPrefix(env, prefix) {
   if (!env.DATA) return 0;
   let cursor = undefined;
@@ -265,25 +321,28 @@ async function sendAdminMenu(env, chatId) {
   const keyboard = {
     inline_keyboard: [
       [
-        { text: 'آپلود بسته‌ای', callback_data: 'admin:upload' },
+        { text: '📦 آپلود بسته‌ای', callback_data: 'admin:upload' },
       ],
       [
-        { text: 'آمار', callback_data: 'admin:stats' },
-        { text: 'پیام همگانی', callback_data: 'admin:broadcast' },
+        { text: '📊 آمار', callback_data: 'admin:stats' },
+        { text: '📣 پیام همگانی', callback_data: 'admin:broadcast' },
       ],
       [
-        { text: 'تنظیم جویـن', callback_data: 'admin:setjoin' },
-        { text: 'خاموش کردن جویـن', callback_data: 'admin:disablejoin' },
+        { text: '🔗 تنظیم جویـن', callback_data: 'admin:setjoin' },
+        { text: '❌ حذف کانال جویـن', callback_data: 'admin:removejoin' },
       ],
       [
-        { text: 'مدیریت ادمین‌ها', callback_data: 'admin:admins' },
+        { text: '📁 مدیریت فایل‌ها', callback_data: 'admin:files' },
       ],
       [
-        { text: 'بروزرسانی منو 🔄', callback_data: 'admin:menu' },
+        { text: '🛡️ مدیریت ادمین‌ها', callback_data: 'admin:admins' },
+      ],
+      [
+        { text: '🔄 بروزرسانی منو', callback_data: 'admin:menu' },
       ],
     ],
   };
-  await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'منوی مدیریت', reply_markup: keyboard });
+  await tgCall(env, 'sendMessage', { chat_id: chatId, text: '🛠️ منوی مدیریت', reply_markup: keyboard });
 }
 
 async function buildDeepLink(env, code) {
@@ -396,12 +455,20 @@ async function handleStart(env, request, update) {
 
   const media = await getMedia(env, code);
   if (media) {
+    if (media.disabled) {
+      await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'این لینک غیرفعال شده است.' });
+      return;
+    }
     await sendMediaByType(env, chatId, media);
     return;
   }
   const bundle = await getBundle(env, code);
   if (!bundle || !Array.isArray(bundle.items) || bundle.items.length === 0) {
     await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'کد اشتراک نامعتبر است.' });
+    return;
+  }
+  if (bundle.disabled) {
+    await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'این لینک غیرفعال شده است.' });
     return;
   }
   // Send bundle sequentially
@@ -427,12 +494,20 @@ async function handleCallback(env, update) {
     await answer('عضویت تایید شد.');
     const media = await getMedia(env, code);
     if (media) {
+      if (media.disabled) {
+        await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'این لینک غیرفعال شده است.' });
+        return;
+      }
       await sendMediaByType(env, chatId, media);
       return;
     }
     const bundle = await getBundle(env, code);
     if (!bundle || !Array.isArray(bundle.items) || bundle.items.length === 0) {
       await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'کد اشتراک نامعتبر است.' });
+      return;
+    }
+    if (bundle.disabled) {
+      await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'این لینک غیرفعال شده است.' });
       return;
     }
     for (const item of bundle.items) {
@@ -462,6 +537,46 @@ async function handleCallback(env, update) {
         [{ text: 'بازگشت', callback_data: 'admin:menu' }],
       ] };
       await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'مدیریت ادمین‌ها', reply_markup: kb });
+      return;
+    }
+    if (data === 'admin:files') {
+      await answer('فایل‌ها');
+      const kb = { inline_keyboard: [
+        [{ text: '🚫 غیرفعال‌کردن لینک', callback_data: 'admin:disable' }],
+        [{ text: '✅ فعال‌کردن لینک', callback_data: 'admin:enable' }],
+        [{ text: '🗑️ حذف لینک', callback_data: 'admin:delete' }],
+        [{ text: 'ℹ️ اطلاعات لینک', callback_data: 'admin:info' }],
+        [{ text: 'بازگشت', callback_data: 'admin:menu' }],
+      ] };
+      await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'مدیریت لینک‌ها', reply_markup: kb });
+      return;
+    }
+    if (data === 'admin:disable') {
+      await setState(env, userId, 'await_disable_code');
+      const kb = { inline_keyboard: [[{ text: 'انصراف', callback_data: 'admin:cancel' }]] };
+      await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'کد لینک را ارسال کنید تا غیرفعال شود.', reply_markup: kb });
+      await answer('غیرفعال');
+      return;
+    }
+    if (data === 'admin:enable') {
+      await setState(env, userId, 'await_enable_code');
+      const kb = { inline_keyboard: [[{ text: 'انصراف', callback_data: 'admin:cancel' }]] };
+      await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'کد لینک را ارسال کنید تا فعال شود.', reply_markup: kb });
+      await answer('فعال');
+      return;
+    }
+    if (data === 'admin:delete') {
+      await setState(env, userId, 'await_delete_code');
+      const kb = { inline_keyboard: [[{ text: 'انصراف', callback_data: 'admin:cancel' }]] };
+      await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'کد لینک را ارسال کنید تا حذف شود.', reply_markup: kb });
+      await answer('حذف');
+      return;
+    }
+    if (data === 'admin:info') {
+      await setState(env, userId, 'await_info_code');
+      const kb = { inline_keyboard: [[{ text: 'انصراف', callback_data: 'admin:cancel' }]] };
+      await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'کد لینک را ارسال کنید تا اطلاعات نمایش داده شود.', reply_markup: kb });
+      await answer('اطلاعات');
       return;
     }
     if (data === 'admin:addadmin') {
@@ -524,16 +639,16 @@ async function handleCallback(env, update) {
       await answer('تنظیم کانال');
       await setState(env, userId, 'await_join_channel');
       const kb = { inline_keyboard: [[{ text: 'انصراف', callback_data: 'admin:cancel' }]] };
-      await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'نام کاربری کانال را ارسال کنید (بدون @). برای خاموش: off', reply_markup: kb });
+      await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'نام کاربری کانال را ارسال کنید (بدون @). برای حذف: off', reply_markup: kb });
       return;
     }
-    if (data === 'admin:disablejoin') {
-      await answer('غیرفعال شد');
+    if (data === 'admin:removejoin') {
+      await answer('حذف شد');
       if (env.DATA) {
         await env.DATA.put('config:force_join_channel', '');
         env.__forceJoinChannel = '';
       }
-      await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'جویـن اجباری غیرفعال شد.' });
+      await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'کانال جویـن حذف شد.' });
       return;
     }
     if (data === 'admin:cancel') {
@@ -580,7 +695,7 @@ async function handleAdminCommands(env, update, request) {
     await setState(env, msg.from.id, 'await_join_channel');
     const kb = { inline_keyboard: [[{ text: 'انصراف', callback_data: 'admin:cancel' }]] };
     const curr = getForceJoinChannel(env) || 'غیرفعال';
-    const hint = arg ? `مقدار فعلی: ${curr}\nپیشنهاد شده: ${arg}\nبرای تایید، همان مقدار را دوباره ارسال کنید.` : `مقدار فعلی: ${curr}\nنام کاربری کانال را ارسال کنید (بدون @). برای خاموش: off`;
+    const hint = arg ? `مقدار فعلی: ${curr}\nپیشنهاد شده: ${arg}\nبرای تایید، همان مقدار را دوباره ارسال کنید.` : `مقدار فعلی: ${curr}\nنام کاربری کانال را ارسال کنید (بدون @). برای حذف: off`;
     await tgCall(env, 'sendMessage', { chat_id: chatId, text: hint, reply_markup: kb });
     return;
   }
@@ -688,6 +803,49 @@ async function handleWebhook(request, env, ctx) {
         env.__forceJoinChannel = val;
         await tgCall(env, 'sendMessage', { chat_id: msg.chat.id, text: val ? `کانال اجباری تنظیم شد: @${val}` : 'کانال اجباری غیرفعال شد.' });
         await sendAdminMenu(env, msg.chat.id, true);
+        return jsonResponse({ ok: true });
+      }
+      if (st === 'await_disable_code' && msg.text) {
+        const code = (msg.text || '').trim();
+        await clearState(env, userId);
+        const ok = await setDisabled(env, code, true);
+        await tgCall(env, 'sendMessage', { chat_id: msg.chat.id, text: ok ? `لینک ${code} غیرفعال شد.` : 'کد یافت نشد.' });
+        return jsonResponse({ ok: true });
+      }
+      if (st === 'await_enable_code' && msg.text) {
+        const code = (msg.text || '').trim();
+        await clearState(env, userId);
+        const ok = await setDisabled(env, code, false);
+        await tgCall(env, 'sendMessage', { chat_id: msg.chat.id, text: ok ? `لینک ${code} فعال شد.` : 'کد یافت نشد.' });
+        return jsonResponse({ ok: true });
+      }
+      if (st === 'await_delete_code' && msg.text) {
+        const code = (msg.text || '').trim();
+        await clearState(env, userId);
+        const ok = await deleteCode(env, code);
+        await tgCall(env, 'sendMessage', { chat_id: msg.chat.id, text: ok ? `لینک ${code} حذف شد.` : 'کد یافت نشد.' });
+        return jsonResponse({ ok: true });
+      }
+      if (st === 'await_info_code' && msg.text) {
+        const code = (msg.text || '').trim();
+        await clearState(env, userId);
+        const info = await getLinkInfo(env, code);
+        if (!info) {
+          await tgCall(env, 'sendMessage', { chat_id: msg.chat.id, text: 'کد یافت نشد.' });
+          return jsonResponse({ ok: true });
+        }
+        const base = siteBase(request);
+        const deep = await buildDeepLink(env, code);
+        const lines = [
+          `کد: ${code}`,
+          `نوع: ${info.type}`,
+          `وضعیت: ${info.disabled ? 'غیرفعال' : 'فعال'}`,
+          info.type === 'media' ? `رسانه: ${info.media_type}` : `تعداد اقلام: ${info.count}`,
+          `تاریخ: ${info.created_at ? new Date(info.created_at).toLocaleString('fa-IR') : '-'}`,
+          `وب: ${base}/s/${code}`,
+          `تلگرام: ${deep}`,
+        ].join('\n');
+        await tgCall(env, 'sendMessage', { chat_id: msg.chat.id, text: lines, disable_web_page_preview: true });
         return jsonResponse({ ok: true });
       }
 
@@ -815,8 +973,11 @@ async function handleShare(request, env) {
   const url = new URL(request.url);
   const code = url.pathname.split('/').pop();
   const media = await getMedia(env, code);
+  const bundle = media ? null : await getBundle(env, code);
   const base = siteBase(request);
   const deep = await buildDeepLink(env, code);
+  const exists = !!media || !!bundle;
+  const disabled = media ? !!media.disabled : (bundle ? !!bundle.disabled : false);
   const body = `<!doctype html>
 <html lang="fa" dir="rtl">
 <head>
@@ -832,13 +993,13 @@ async function handleShare(request, env) {
 <body>
   <div class="card">
     <h2>لینک اشتراک</h2>
-    ${media ? `<p>برای دریافت رسانه روی دکمه زیر بزنید.</p>` : `<p>کد یافت نشد یا منقضی شده است.</p>`}
-    ${media ? `<p><a class="btn" href="${deep}">باز کردن در تلگرام</a></p>` : ''}
+    ${!exists ? `<p>کد یافت نشد یا منقضی شده است.</p>` : disabled ? `<p>این لینک غیرفعال شده است.</p>` : `<p>برای دریافت رسانه روی دکمه زیر بزنید.</p>`}
+    ${exists && !disabled ? `<p><a class="btn" href="${deep}">باز کردن در تلگرام</a></p>` : ''}
     <p class="muted"><small>${base}</small></p>
   </div>
 </body>
 </html>`;
-  return htmlResponse(body, { status: media ? 200 : 404 });
+  return htmlResponse(body, { status: exists ? 200 : 404 });
 }
 
 const APP = {
