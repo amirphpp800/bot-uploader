@@ -123,8 +123,12 @@ async function ensureBotUsername(env) {
 }
 
 function getForceJoinChannel(env) {
-  // Priority: KV config -> ENV
-  return env.__forceJoinChannel || env.FORCE_JOIN_CHANNEL || '';
+  // For panel display
+  const r = getForceJoinRule(env);
+  if (!r || r.type === 'none') return '';
+  if (r.type === 'username') return `@${r.username}`;
+  if (r.type === 'private') return r.invite || 'خصوصی';
+  return '';
 }
 
 async function loadConfig(env) {
@@ -132,7 +136,16 @@ async function loadConfig(env) {
   try {
     if (env.DATA) {
       const fj = await env.DATA.get('config:force_join_channel');
-      if (fj) env.__forceJoinChannel = fj;
+      if (fj) {
+        try {
+          const obj = JSON.parse(fj);
+          env.__forceJoinRule = obj;
+        } catch {
+          env.__forceJoinRule = { type: 'username', username: fj.replace(/^@/, '') };
+        }
+      } else {
+        env.__forceJoinRule = env.__forceJoinRule || { type: 'none' };
+      }
       const admins = await env.DATA.get('config:admins');
       if (admins) {
         const arr = admins.split(',').map((s) => s.trim()).filter(Boolean);
@@ -144,6 +157,16 @@ async function loadConfig(env) {
   } catch (e) {
     console.warn('Config load failed', e);
   }
+}
+
+function getForceJoinRule(env) {
+  return env.__forceJoinRule || { type: 'none' };
+}
+
+async function setForceJoinRule(env, rule) {
+  env.__forceJoinRule = rule;
+  if (!env.DATA) return;
+  try { await env.DATA.put('config:force_join_channel', JSON.stringify(rule)); } catch (e) { console.warn('setForceJoinRule failed', e); }
 }
 
 async function listAdmins(env) {
@@ -317,31 +340,36 @@ async function clearState(env, userId) {
   try { await env.DATA.delete(`state:${userId}`); } catch (e) { console.warn('clearState failed', e); }
 }
 
-async function sendAdminMenu(env, chatId) {
-  const keyboard = {
-    inline_keyboard: [
-      [
-        { text: '📦 آپلود بسته‌ای', callback_data: 'admin:upload' },
-      ],
-      [
-        { text: '📊 آمار', callback_data: 'admin:stats' },
-        { text: '📣 پیام همگانی', callback_data: 'admin:broadcast' },
-      ],
-      [
-        { text: '🔗 تنظیم جویـن', callback_data: 'admin:setjoin' },
-        { text: '❌ حذف کانال جویـن', callback_data: 'admin:removejoin' },
-      ],
-      [
-        { text: '📁 مدیریت فایل‌ها', callback_data: 'admin:files' },
-      ],
-      [
-        { text: '🛡️ مدیریت ادمین‌ها', callback_data: 'admin:admins' },
-      ],
-      [
-        { text: '🔄 بروزرسانی منو', callback_data: 'admin:menu' },
-      ],
-    ],
-  };
+async function sendAdminMenu(env, chatId, userId) {
+  const owner = isOwner(userId, env);
+  const rows = [];
+  // Upload row (all admins)
+  rows.push([{ text: '📦 آپلود بسته‌ای', callback_data: 'admin:upload' }]);
+  // Stats (+ Broadcast if owner)
+  if (owner) {
+    rows.push([
+      { text: '📊 آمار', callback_data: 'admin:stats' },
+      { text: '📣 پیام همگانی', callback_data: 'admin:broadcast' },
+    ]);
+  } else {
+    rows.push([{ text: '📊 آمار', callback_data: 'admin:stats' }]);
+  }
+  // Join settings (owner only)
+  if (owner) {
+    rows.push([
+      { text: '🔗 تنظیم جویـن', callback_data: 'admin:setjoin' },
+      { text: '❌ حذف کانال جویـن', callback_data: 'admin:removejoin' },
+    ]);
+  }
+  // File management (all admins)
+  rows.push([{ text: '📁 مدیریت فایل‌ها', callback_data: 'admin:files' }]);
+  // Admin management (owner only)
+  if (owner) {
+    rows.push([{ text: '🛡️ مدیریت ادمین‌ها', callback_data: 'admin:admins' }]);
+  }
+  // Refresh
+  rows.push([{ text: '🔄 بروزرسانی منو', callback_data: 'admin:menu' }]);
+  const keyboard = { inline_keyboard: rows };
   await tgCall(env, 'sendMessage', { chat_id: chatId, text: '🛠️ منوی مدیریت', reply_markup: keyboard });
 }
 
@@ -385,13 +413,26 @@ async function handleBroadcast(env, text, ctx, chatId) {
 }
 
 async function enforceJoin(env, userId) {
-  const channel = getForceJoinChannel(env).replace(/^@/, '');
-  if (!channel) return { required: false, ok: true, channel: '' };
-  const r = await tgGet(env, 'getChatMember', { chat_id: `@${channel}`, user_id: userId });
-  if (!r.ok) return { required: true, ok: false, channel };
-  const status = r.result?.status;
-  const ok = status && status !== 'left' && status !== 'kicked';
-  return { required: true, ok, channel };
+  const rule = getForceJoinRule(env);
+  if (!rule || rule.type === 'none') return { required: false, ok: true, channel: '' };
+  if (rule.type === 'username') {
+    const channel = rule.username.replace(/^@/, '');
+    const r = await tgGet(env, 'getChatMember', { chat_id: `@${channel}`, user_id: userId });
+    if (!r.ok) return { required: true, ok: false, channel };
+    const status = r.result?.status;
+    const ok = status && status !== 'left' && status !== 'kicked';
+    return { required: true, ok, channel };
+  }
+  if (rule.type === 'private') {
+    const chat_id = rule.chat_id;
+    if (!chat_id) return { required: true, ok: false, channel: '' };
+    const r = await tgGet(env, 'getChatMember', { chat_id, user_id: userId });
+    if (!r.ok) return { required: true, ok: false, channel: '' };
+    const status = r.result?.status;
+    const ok = status && status !== 'left' && status !== 'kicked';
+    return { required: true, ok, channel: '' };
+  }
+  return { required: false, ok: true, channel: '' };
 }
 
 async function sendMediaByType(env, chatId, media, extra = {}) {
@@ -433,15 +474,19 @@ async function handleStart(env, request, update) {
       return;
     }
     // Admin: show menu
-    await sendAdminMenu(env, chatId);
+    await sendAdminMenu(env, chatId, userId);
     return;
   }
 
   const rule = await enforceJoin(env, userId);
   if (rule.required && !rule.ok) {
+    const fr = getForceJoinRule(env);
+    let joinUrl = 'https://t.me';
+    if (fr && fr.type === 'username') joinUrl = `https://t.me/${fr.username}`;
+    if (fr && fr.type === 'private' && fr.invite) joinUrl = fr.invite;
     const keyboard = {
       inline_keyboard: [
-        [{ text: 'عضویت در کانال', url: `https://t.me/${rule.channel}` }],
+        [{ text: 'عضویت در کانال', url: joinUrl }],
         [{ text: 'بررسی عضویت ✅', callback_data: `check:${code}` }],
       ],
     };
@@ -489,6 +534,21 @@ async function handleCallback(env, update) {
     const rule = await enforceJoin(env, userId);
     if (!rule.ok) {
       await answer('هنوز عضو کانال نشده‌اید.');
+      const fr = getForceJoinRule(env);
+      let joinUrl = 'https://t.me';
+      if (fr && fr.type === 'username') joinUrl = `https://t.me/${fr.username}`;
+      if (fr && fr.type === 'private' && fr.invite) joinUrl = fr.invite;
+      const keyboard = {
+        inline_keyboard: [
+          [{ text: 'عضویت در کانال', url: joinUrl }],
+          [{ text: 'بررسی عضویت ✅', callback_data: `check:${code}` }],
+        ],
+      };
+      await tgCall(env, 'sendMessage', {
+        chat_id: chatId,
+        text: 'لطفاً ابتدا در کانال عضو شوید و سپس روی دکمه «بررسی عضویت» بزنید.',
+        reply_markup: keyboard,
+      });
       return;
     }
     await answer('عضویت تایید شد.');
@@ -526,10 +586,15 @@ async function handleCallback(env, update) {
   if (isAdmin(userId, env)) {
     if (data === 'admin:menu') {
       await answer('منو');
-      await sendAdminMenu(env, chatId, true);
+      await sendAdminMenu(env, chatId, userId);
       return;
     }
     if (data === 'admin:admins') {
+      if (!isOwner(userId, env)) {
+        await answer('اجازه ندارید');
+        await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'این بخش فقط برای صاحب ربات است.' });
+        return;
+      }
       await answer('ادمین‌ها');
       const kb = { inline_keyboard: [
         [{ text: 'افزودن ادمین ➕', callback_data: 'admin:addadmin' }],
@@ -592,6 +657,11 @@ async function handleCallback(env, update) {
       return;
     }
     if (data === 'admin:listadmins') {
+      if (!isOwner(userId, env)) {
+        await answer('اجازه ندارید');
+        await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'این بخش فقط برای صاحب ربات است.' });
+        return;
+      }
       const arr = await listAdmins(env);
       await tgCall(env, 'sendMessage', { chat_id: chatId, text: arr.length ? `ادمین‌ها:\n${arr.join('\n')}` : 'ادمینی ثبت نشده.' });
       await answer('نمایش لیست');
@@ -629,6 +699,11 @@ async function handleCallback(env, update) {
       return;
     }
     if (data === 'admin:broadcast') {
+      if (!isOwner(userId, env)) {
+        await answer('اجازه ندارید');
+        await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'این بخش فقط برای صاحب ربات است.' });
+        return;
+      }
       await answer('پیام همگانی');
       await setState(env, userId, 'await_broadcast_text');
       const kb = { inline_keyboard: [[{ text: 'انصراف', callback_data: 'admin:cancel' }]] };
@@ -636,25 +711,32 @@ async function handleCallback(env, update) {
       return;
     }
     if (data === 'admin:setjoin') {
+      if (!isOwner(userId, env)) {
+        await answer('اجازه ندارید');
+        await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'این بخش فقط برای صاحب ربات است.' });
+        return;
+      }
       await answer('تنظیم کانال');
       await setState(env, userId, 'await_join_channel');
       const kb = { inline_keyboard: [[{ text: 'انصراف', callback_data: 'admin:cancel' }]] };
-      await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'نام کاربری کانال را ارسال کنید (بدون @). برای حذف: off', reply_markup: kb });
+      await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'نام کاربری کانال (بدون @) یا لینک دعوت خصوصی t.me/+... را ارسال کنید.\nبرای حذف: off\nهمچنین می‌توانید یک پیام از کانال را فوروارد کنید تا شناسه کانال ثبت شود.', reply_markup: kb });
       return;
     }
     if (data === 'admin:removejoin') {
-      await answer('حذف شد');
-      if (env.DATA) {
-        await env.DATA.put('config:force_join_channel', '');
-        env.__forceJoinChannel = '';
+      if (!isOwner(userId, env)) {
+        await answer('اجازه ندارید');
+        await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'این بخش فقط برای صاحب ربات است.' });
+        return;
       }
+      await answer('حذف شد');
+      await setForceJoinRule(env, { type: 'none' });
       await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'کانال جویـن حذف شد.' });
       return;
     }
     if (data === 'admin:cancel') {
       await answer('انصراف');
       await clearState(env, userId);
-      await sendAdminMenu(env, chatId, true);
+      await sendAdminMenu(env, chatId, userId);
       return;
     }
   }
@@ -682,6 +764,10 @@ async function handleAdminCommands(env, update, request) {
   const text = msg.text || '';
 
   if (text.startsWith('/broadcast')) {
+    if (!isOwner(msg.from.id, env)) {
+      await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'این دستور فقط برای صاحب ربات مجاز است.' });
+      return;
+    }
     const payload = text.replace('/broadcast', '').trim();
     await setState(env, msg.from.id, 'await_broadcast_text');
     const kb = { inline_keyboard: [[{ text: 'انصراف', callback_data: 'admin:cancel' }]] };
@@ -691,11 +777,15 @@ async function handleAdminCommands(env, update, request) {
   }
 
   if (text.startsWith('/setjoin')) {
+    if (!isOwner(msg.from.id, env)) {
+      await tgCall(env, 'sendMessage', { chat_id: chatId, text: 'این دستور فقط برای صاحب ربات مجاز است.' });
+      return;
+    }
     const arg = text.replace('/setjoin', '').trim();
     await setState(env, msg.from.id, 'await_join_channel');
     const kb = { inline_keyboard: [[{ text: 'انصراف', callback_data: 'admin:cancel' }]] };
     const curr = getForceJoinChannel(env) || 'غیرفعال';
-    const hint = arg ? `مقدار فعلی: ${curr}\nپیشنهاد شده: ${arg}\nبرای تایید، همان مقدار را دوباره ارسال کنید.` : `مقدار فعلی: ${curr}\nنام کاربری کانال را ارسال کنید (بدون @). برای حذف: off`;
+    const hint = arg ? `مقدار فعلی: ${curr}\nپیشنهاد شده: ${arg}\nبرای تایید، همان مقدار را دوباره ارسال کنید.` : `مقدار فعلی: ${curr}\nنام کاربری کانال (بدون @) یا لینک دعوت خصوصی t.me/+... را ارسال کنید.\nبرای حذف: off\nهمچنین می‌توانید یک پیام از کانال را فوروارد کنید تا شناسه کانال ثبت شود.`;
     await tgCall(env, 'sendMessage', { chat_id: chatId, text: hint, reply_markup: kb });
     return;
   }
@@ -780,29 +870,102 @@ async function handleWebhook(request, env, ctx) {
     if (isAdmin(userId, env)) {
       // Admin state machine
       const st = await getState(env, userId);
-      if (st === 'await_broadcast_text' && msg.text) {
-        await clearState(env, userId);
-        // background broadcast
-        if (ctx && typeof ctx.waitUntil === 'function') {
-          ctx.waitUntil(handleBroadcast(env, msg.text, ctx, msg.chat.id));
-        } else {
-          // fallback without blocking
-          handleBroadcast(env, msg.text, null, msg.chat.id);
-        }
-        await tgCall(env, 'sendMessage', { chat_id: msg.chat.id, text: 'ارسال همگانی شروع شد...' });
-        return jsonResponse({ ok: true });
-      }
-      if (st === 'await_join_channel' && msg.text) {
-        const val = msg.text.trim().toLowerCase() === 'off' ? '' : msg.text.trim().replace(/^@/, '');
-        await clearState(env, userId);
-        if (!env.DATA) {
-          await tgCall(env, 'sendMessage', { chat_id: msg.chat.id, text: 'KV متصل نیست.' });
+      
+      if (st === 'await_add_admin' && msg.text) {
+        // Owner-only safeguard
+        if (!isOwner(userId, env)) {
+          await clearState(env, userId);
+          await tgCall(env, 'sendMessage', { chat_id: msg.chat.id, text: 'این بخش فقط برای صاحب ربات است.' });
           return jsonResponse({ ok: true });
         }
-        await env.DATA.put('config:force_join_channel', val);
-        env.__forceJoinChannel = val;
-        await tgCall(env, 'sendMessage', { chat_id: msg.chat.id, text: val ? `کانال اجباری تنظیم شد: @${val}` : 'کانال اجباری غیرفعال شد.' });
-        await sendAdminMenu(env, msg.chat.id, true);
+        const target = (msg.text || '').trim();
+        await clearState(env, userId);
+        try {
+          await addAdmin(env, target);
+          await tgCall(env, 'sendMessage', { chat_id: msg.chat.id, text: `ادمین جدید اضافه شد: ${target}` });
+        } catch (e) {
+          await tgCall(env, 'sendMessage', { chat_id: msg.chat.id, text: 'ورودی نامعتبر است. فقط آی‌دی عددی را بفرستید.' });
+        }
+        return jsonResponse({ ok: true });
+      }
+      if (st === 'await_broadcast_text' && msg.text) {
+        // Owner-only safeguard
+        if (!isOwner(userId, env)) {
+          await clearState(env, userId);
+          await tgCall(env, 'sendMessage', { chat_id: msg.chat.id, text: 'این بخش فقط برای صاحب ربات است.' });
+          return jsonResponse({ ok: true });
+        }
+        await clearState(env, userId);
+        if (ctx && typeof ctx.waitUntil === 'function') {
+          ctx.waitUntil(handleBroadcast(env, msg.text, ctx, msg.chat.id));
+          await tgCall(env, 'sendMessage', { chat_id: msg.chat.id, text: 'در حال ارسال پیام همگانی…' });
+        } else {
+          await handleBroadcast(env, msg.text, ctx, msg.chat.id);
+        }
+        return jsonResponse({ ok: true });
+      }
+      if (st === 'await_join_channel') {
+        // Owner-only safeguard
+        if (!isOwner(userId, env)) {
+          await clearState(env, userId);
+          await tgCall(env, 'sendMessage', { chat_id: msg.chat.id, text: 'این بخش فقط برای صاحب ربات است.' });
+          return jsonResponse({ ok: true });
+        }
+        // If forwarded from channel, capture chat_id and ask for invite link (if not already provided)
+        if (msg.forward_from_chat && msg.forward_from_chat.type === 'channel') {
+          const chId = msg.forward_from_chat.id;
+          await setState(env, userId, `await_join_private_wait_link:${chId}`);
+          const kb = { inline_keyboard: [[{ text: 'انصراف', callback_data: 'admin:cancel' }]] };
+          await tgCall(env, 'sendMessage', { chat_id: msg.chat.id, text: 'لینک دعوت خصوصی t.me/+... را ارسال کنید تا کامل شود.', reply_markup: kb });
+          return jsonResponse({ ok: true });
+        }
+        if (msg.text) {
+          const raw = msg.text.trim();
+          if (raw.toLowerCase() === 'off') {
+            await clearState(env, userId);
+            await setForceJoinRule(env, { type: 'none' });
+            await tgCall(env, 'sendMessage', { chat_id: msg.chat.id, text: 'جویـن اجباری غیرفعال شد.' });
+            await sendAdminMenu(env, msg.chat.id, userId);
+            return jsonResponse({ ok: true });
+          }
+          // Private invite link
+          if (/^https?:\/\/t\.me\/\+[A-Za-z0-9_\-]+$/.test(raw)) {
+            await setState(env, userId, `await_join_private:${raw}`);
+            const kb = { inline_keyboard: [[{ text: 'انصراف', callback_data: 'admin:cancel' }]] };
+            await tgCall(env, 'sendMessage', { chat_id: msg.chat.id, text: 'حالا یک پیام از همان کانال خصوصی فوروارد کنید تا شناسه کانال ثبت شود.', reply_markup: kb });
+            return jsonResponse({ ok: true });
+          }
+          // Username
+          const username = raw.replace(/^@/, '');
+          await clearState(env, userId);
+          await setForceJoinRule(env, { type: 'username', username });
+          await tgCall(env, 'sendMessage', { chat_id: msg.chat.id, text: `کانال اجباری تنظیم شد: @${username}` });
+          await sendAdminMenu(env, msg.chat.id, userId);
+          return jsonResponse({ ok: true });
+        }
+      }
+      // Complete private join when invite link was provided first
+      if (st && st.startsWith('await_join_private:') && msg.forward_from_chat && msg.forward_from_chat.type === 'channel') {
+        const invite = st.split(':').slice(1).join(':');
+        const chId = msg.forward_from_chat.id;
+        await clearState(env, userId);
+        await setForceJoinRule(env, { type: 'private', chat_id: chId, invite });
+        await tgCall(env, 'sendMessage', { chat_id: msg.chat.id, text: 'کانال خصوصی برای جویـن اجباری تنظیم شد.' });
+        await sendAdminMenu(env, msg.chat.id, userId);
+        return jsonResponse({ ok: true });
+      }
+      // Complete private join when forward came first
+      if (st && st.startsWith('await_join_private_wait_link:') && msg.text) {
+        const chId = st.split(':').slice(1).join(':');
+        const raw = msg.text.trim();
+        if (!/^https?:\/\/t\.me\/\+[A-Za-z0-9_\-]+$/.test(raw)) {
+          await tgCall(env, 'sendMessage', { chat_id: msg.chat.id, text: 'لینک دعوت معتبر نیست. نمونه: https://t.me/+XXXXXXXX' });
+          return jsonResponse({ ok: true });
+        }
+        await clearState(env, userId);
+        await setForceJoinRule(env, { type: 'private', chat_id: chId, invite: raw });
+        await tgCall(env, 'sendMessage', { chat_id: msg.chat.id, text: 'کانال خصوصی برای جویـن اجباری تنظیم شد.' });
+        await sendAdminMenu(env, msg.chat.id, userId);
         return jsonResponse({ ok: true });
       }
       if (st === 'await_disable_code' && msg.text) {
@@ -855,7 +1018,7 @@ async function handleWebhook(request, env, ctx) {
 
       // Show admin menu for other texts
       if (msg.text) {
-        await sendAdminMenu(env, msg.chat.id);
+        await sendAdminMenu(env, msg.chat.id, userId);
         return jsonResponse({ ok: true });
       }
     }
